@@ -1,3 +1,158 @@
+# Residencial Aurora: assistente virtual com Google ADK
+
+API em Python (FastAPI) que expõe um assistente construído com Google ADK. O morador reserva o salão de festas, a churrasqueira e a quadra, cancela as próprias reservas, autoriza visitantes e tira dúvidas sobre o regulamento.
+
+A ideia central: **o modelo conduz a conversa, mas as regras críticas vivem no código** (tools, repositório e banco) e continuam valendo não importa o que o morador escreva.
+
+O enunciado original do desafio foi mantido, sem alterações, no final deste arquivo ([ver](#enunciado-original-do-desafio)). As decisões de projeto, com alternativas e motivos, estão em [docs/decisoes/](docs/decisoes/).
+
+## Arquitetura
+
+```
+ morador ──HTTP──► FastAPI (app/main.py)
+                      │
+                      ▼
+             ServicoConversa (app/servico.py) ◄──► PostgreSQL
+                      │                            ├─ schema condominio: reservas, visitantes,
+                      ▼                            │  confirmações, sessão→apartamento
+             Runner + App do ADK                   └─ schema sessoes: sessões e eventos do ADK
+                      │
+                      ▼
+                  principal ──► reservas      (tools de reservas)
+                            ├─► visitantes    (tools de visitantes)
+                            └─► regulamento   (tool de busca no regulamento)
+```
+
+### Agentes ([app/agentes/montagem.py](app/agentes/montagem.py))
+
+Todos os especialistas são acionados como `sub_agents` do principal (transferência de controle). A retomada de confirmações está habilitada no `App` (`ResumabilityConfig(is_resumable=True)`) para que a resposta volte ao agente que a pediu.
+
+| Agente | Responsabilidade | Tools | Por quê é separado |
+|---|---|---|---|
+| `principal` | Entender o pedido e delegar. Responde conversa geral. | nenhuma | Não tem tools de dados nem o regulamento: contexto enxuto e sem poder de gravar |
+| `reservas` | Reservar, cancelar, consultar disponibilidade, listar reservas | [app/tools/reservas.py](app/tools/reservas.py) | Concentra a regra de cobrança e a exclusividade |
+| `visitantes` | Autorizar e listar visitantes | [app/tools/visitantes.py](app/tools/visitantes.py) | Concentra a regra de acesso (sempre com confirmação) |
+| `regulamento` | Responder dúvidas | [app/tools/regulamento.py](app/tools/regulamento.py) | Isola o regulamento: só este agente o consulta, e por trechos |
+
+As instruções dos agentes orientam o modelo, mas **não são as garantias**. Registros: [001](docs/decisoes/001-arquitetura-de-agentes.md) (agentes) e [005](docs/decisoes/005-acionamento-dos-especialistas.md) (acionamento, com o resultado do spike).
+
+### Dados e módulos
+
+- **PostgreSQL** com dois schemas: `condominio` (dados do negócio, migrações Alembic em [migracoes/](migracoes/)) e `sessoes` (tabelas do `DatabaseSessionService` do ADK). Decisão [003](docs/decisoes/003-armazenamento-postgres.md).
+- [app/repositorio/condominio.py](app/repositorio/condominio.py): todo o acesso a dados, em SQL explícito com parâmetros nomeados (sem concatenação de texto, sem injeção de SQL).
+- [app/servico.py](app/servico.py): liga a API ao Runner e registra/responde confirmações (decisão [007](docs/decisoes/007-confirmacoes-em-tabela-propria.md)).
+- [scripts/restaurar.py](scripts/restaurar.py): restauração do estado inicial.
+
+## Garantias
+
+Para cada garantia: onde está no código e por que não depende do que o modelo decide.
+
+### 1. Cobrança ou acesso só com confirmação
+
+- **Cobrança:** em [app/tools/reservas.py](app/tools/reservas.py), a função `exige_confirmacao` consulta a taxa da área (`dados/areas.json`, via banco) e é passada como `require_confirmation` à tool `reservar_area`. Taxa maior que zero pede confirmação; taxa zero não. Área desconhecida também pede (falha fechada).
+- **Acesso:** em [app/tools/visitantes.py](app/tools/visitantes.py), `autorizar_visitante` usa `require_confirmation=True`.
+- **A confirmação vem do sistema:** a tool só executa depois que o ADK recebe um `FunctionResponse` de confirmação, enviado pela rota `POST /sessoes/{id}/confirmacoes`. Texto como "já confirmei" é só uma mensagem e nunca chega a esse caminho.
+- **`409` e execução única:** o ADK **não** impede a repetição de uma resposta (descobrimos no spike: uma confirmação negada e reenviada como aprovada executou a ação). Por isso `ServicoConversa.responder_confirmacao` em [app/servico.py](app/servico.py) só repassa a resposta ao ADK se `RepositorioCondominio.responder_confirmacao` ([app/repositorio/condominio.py](app/repositorio/condominio.py)) vencer a transição atômica `UPDATE ... WHERE estado = 'pendente'`. Id inexistente, de outra sessão ou já respondido muda zero linhas e vira `409`.
+
+### 2. Cada sessão pertence a um apartamento
+
+- O apartamento é definido **uma única vez**, em `ServicoConversa.criar_sessao`, e fica no `state` da sessão do ADK e na tabela `condominio.sessoes`. O trigger `sessao_imutavel` ([migração 0002](migracoes/versions/0002_sessoes_do_apartamento.py)) proíbe alterá-lo depois.
+- As tools leem o apartamento com `apartamento_da_sessao` ([app/tools/_comum.py](app/tools/_comum.py)), de `tool_context.state`. **Nenhuma tool tem parâmetro `apartamento`**, então o modelo não tem como apontar para outro. Um teste automatizado garante isso: `test_nenhuma_tool_aceita_apartamento_como_parametro` em [tests/test_tools.py](tests/test_tools.py).
+- `cancelar` filtra `WHERE apartamento = :apartamento` ([repositório](app/repositorio/condominio.py)), e a listagem só devolve o apartamento da sessão.
+- Checar disponibilidade usa `area_disponivel`, que devolve só `True`/`False`, nunca de quem é a reserva. As respostas das tools são genéricas, sem códigos nem apartamentos de terceiros, porque o que a tool devolve vira evento da sessão.
+
+### 3. Nada se perde no reinício
+
+- As sessões do ADK usam `DatabaseSessionService` sobre PostgreSQL, no schema `sessoes` ([app/main.py](app/main.py), função `lifespan`, com `search_path`). Os dados do condomínio também ficam no PostgreSQL, em volume Docker persistente ([docker-compose.yml](docker-compose.yml)).
+- Confirmações pendentes ficam em tabela, então sobrevivem ao reinício.
+- Códigos de reserva vêm de uma sequência do banco (começa em 10000) e o cancelamento é lógico: o código de uma reserva cancelada continua ocupado na chave primária.
+
+### 4. O regulamento é consultado, não carregado
+
+- O texto fica em `dados/regulamento.md` e é indexado por artigo em [app/regulamento/busca.py](app/regulamento/busca.py). A tool `consultar_regulamento` devolve **no máximo 3 artigos** relevantes.
+- Como o resultado de uma tool vira evento da sessão, só esses trechos entram no histórico, nunca o texto inteiro nem capítulos de outros assuntos.
+- O agente `principal` não recebe o regulamento (ver `INSTRUCAO_PRINCIPAL` em [montagem.py](app/agentes/montagem.py)) e não tem a tool de busca.
+
+### 5. Dois moradores, uma reserva
+
+- **Exclusividade no banco:** índice único parcial `reservas_area_data_ativa_uq` em `(area, data) WHERE status = 'ativa'` ([migração 0001](migracoes/versions/0001_schema_inicial.py)).
+- **Gravação atômica:** `RepositorioCondominio.reservar` faz um único `INSERT ... ON CONFLICT (area, data) WHERE status = 'ativa' DO NOTHING RETURNING codigo`. Não há "conferir e depois gravar". Quem perde recebe `indisponivel`, que o assistente comunica numa resposta normal (sem erro de servidor).
+- **Teste:** `test_garantia5_duas_reservas_simultaneas_so_uma_vence` em [tests/test_repositorio.py](tests/test_repositorio.py) dispara 24 reservas simultâneas e exige exatamente uma criada.
+
+## Como rodar
+
+### Pré-requisitos
+
+- [uv](https://docs.astral.sh/uv/) (instala o Python 3.12 automaticamente se preciso)
+- Docker (para o PostgreSQL)
+- Chave do [Google AI Studio](https://aistudio.google.com/) com saldo/cota
+
+### Variáveis do `.env`
+
+Copie `.env.example` para `.env` e preencha:
+
+| Variável | Uso |
+|---|---|
+| `GOOGLE_API_KEY` | Chave do Google AI Studio (obrigatória) |
+| `GOOGLE_GENAI_USE_VERTEXAI` | `FALSE` (se vazia, assume `FALSE`) |
+| `MODELO_PRINCIPAL` | Modelo Gemini do agente principal (obrigatória) |
+| `MODELO_ESPECIALISTAS` | Modelo Gemini dos especialistas (obrigatória) |
+| `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_PORT` | Opcionais. Se vazias, valem os padrões do `docker-compose.yml` (`aurora`/`aurora`/`aurora`/`5432`) |
+| `AMBIENTE` | Se for `producao`, o comando de restauração se recusa a rodar |
+
+Consulte no AI Studio quais modelos estão disponíveis na sua conta.
+
+### Subir
+
+```bash
+docker compose up -d                       # PostgreSQL (aguarde ficar healthy)
+uv sync                                    # instala as dependências
+uv run python -m scripts.restaurar --sim   # restaura o estado inicial (ver abaixo)
+uv run uvicorn app.main:app --port 8000    # sobe a API em http://localhost:8000
+```
+
+Para reiniciar a API sem perder nada, pare com Ctrl+C e rode de novo o último comando (**sem** restaurar).
+
+### Restaurar os dados iniciais
+
+```bash
+uv run python -m scripts.restaurar --sim
+```
+
+É um **reset completo**: apaga os schemas `condominio` e `sessoes`, recria o esquema pelas migrações e recarrega `dados/*.json`. Reservas, visitantes, confirmações e sessões voltam ao zero. Sem `--sim` o comando não faz nada, e com `AMBIENTE=producao` ele se recusa a rodar.
+
+> **Pare a API antes de restaurar.** A restauração apaga as tabelas de sessão do ADK, e uma API em execução continuaria achando que elas existem.
+
+### Rotas
+
+`POST /sessoes`, `POST /sessoes/{id}/mensagens`, `POST /sessoes/{id}/confirmacoes`, `GET /sessoes/{id}/eventos`, e as rotas de verificação `GET /apartamentos/{n}/reservas` e `GET /apartamentos/{n}/visitantes`.
+
+### Testes
+
+```bash
+uv run pytest            # 19 testes sem modelo (banco aurora_test); requer o Postgres no ar
+uv run pytest -m e2e     # fluxo do avaliador com o Gemini REAL (gasta créditos, ~3 min)
+uv run ruff check .
+```
+
+O teste e2e sobe a API sozinho num banco separado (`aurora_e2e`), reproduz os passos 1 a 14 do enunciado (incluindo reiniciar a API e a disputa simultânea) e grava o relatório em [docs/evidencias/e2e-ultima-execucao.md](docs/evidencias/e2e-ultima-execucao.md). O que cada teste prova e como rodar está em [docs/testes.md](docs/testes.md).
+
+## Limitações conhecidas
+
+- A busca no regulamento é por palavras: a instrução do agente pede que ele inclua sinônimos na consulta, mas perguntas com vocabulário muito diferente do texto podem não achar o artigo. Uma busca semântica (pgvector) é uma evolução natural.
+- A trava que serializa execuções da mesma sessão é em memória (um processo). Com várias instâncias da API seria preciso um lock no banco.
+- A aplicação conecta ao banco com o usuário dono do schema. Em produção, usaríamos um usuário só com os privilégios necessários.
+- Se o Runner falhar depois de uma confirmação ser respondida, a confirmação continua consumida e a API responde `500`: preferimos "no máximo uma vez" a arriscar executar duas (decisão 007).
+
+---
+
+## Enunciado original do desafio
+
+Texto original do repositório base, mantido sem alterações.
+
+<details>
+<summary>Expandir o enunciado</summary>
+
 # Regra é regra: o assistente virtual do Residencial Aurora
 
 O Residencial Aurora vai ganhar um assistente no aplicativo dos moradores. Pelo chat, cada morador reserva o salão de festas, a churrasqueira e a quadra, cancela as próprias reservas, autoriza a entrada de visitantes e tira dúvidas sobre o regulamento interno.
@@ -282,3 +437,5 @@ O README tem três seções. Arquitetura descreve cada agente, sua responsabilid
 A armadilha mais cara deste desafio é silenciosa: a rota de confirmações aceita a resposta, nenhum erro aparece e a ação não executa. A retomada só funciona quando a resposta chega ao agente que pediu a confirmação, e quem escolhe esse agente é o Runner. Nos nossos testes, nas versões 2.2.0 e 2.9.1, essa escolha mudou conforme a topologia dos agentes, os bloqueios de transferência, a configuração de retomada do App e o serviço de sessão, e uma combinação que funcionava em memória falhou com a sessão persistida. A página de confirmação de ações da documentação oficial diz que alguns serviços de sessão não são suportados, mas, nesses mesmos testes, a confirmação funcionou com sessão persistida em SQLite quando a resposta chegou ao agente certo. Por isso, teste a aprovação com a sessão persistida e depois de reiniciar a API, não só no adk web.
 
 Enquanto desenvolve, o adk web continua sendo o melhor lugar para ver transferências, chamadas de tool e pedidos de confirmação acontecendo. E a filosofia do desafio cabe numa frase: o modelo decide o caminho, o código decide o que é permitido.
+
+</details>

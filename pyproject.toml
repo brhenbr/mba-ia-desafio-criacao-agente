@@ -1,0 +1,36 @@
+[project]
+name = "assistente-residencial-aurora"
+version = "0.1.0"
+description = "Assistente virtual do Residencial Aurora construido com Google ADK"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "google-adk==2.9.1",
+    "fastapi",
+    "uvicorn",
+    "sqlalchemy[asyncio]",
+    "asyncpg",
+    "alembic",
+    "pydantic-settings",
+    "python-dotenv>=1.2.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "httpx",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# Os testes e2e usam o Gemini real (gastam creditos) e so rodam com: pytest -m e2e
+addopts = "-m 'not e2e'"
+markers = ["e2e: testes de ponta a ponta com o Gemini real (gastam creditos)"]
+testpaths = ["tests"]

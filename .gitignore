@@ -1,3 +1,14 @@
 .env
 .venv/
 __pycache__/
+
+# Bancos locais (caso o fallback para SQLite seja usado)
+*.db
+*.db-wal
+*.db-shm
+
+# Enunciado em PDF (nao sobe)
+Descricao projeto.pdf
+
+# Material de estudo pessoal (nao vai para o Git)
+estudo/

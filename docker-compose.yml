@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: aurora-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aurora}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aurora}
+      POSTGRES_DB: ${POSTGRES_DB:-aurora}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - aurora-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aurora} -d ${POSTGRES_DB:-aurora}"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  aurora-pgdata:
